@@ -1,11 +1,4 @@
 #!/usr/bin/env python
-
-"""Insert BIND server/zone/memory statistics info into Graphite.
-
-Handles the case where XML is found in a file as opposed to querying
-BIND's statistics port synchronously.
-"""
-
 import argparse
 import logging
 import pickle
@@ -15,8 +8,6 @@ import sys
 import time
 import urllib2
 import xml.etree.ElementTree as ET
-
-LOGGING_FORMAT = "%(asctime)s : %(levelname)s : %(message)s"
 
 
 class PollerError(Exception):
@@ -45,7 +36,7 @@ class Bind(object):
             self.hostname = "FILE"
 
         self.is_xml_file = self._args.xml_path
-        self.timestamp = time.time()
+        self.timestamp = int(time.time())
         self.xml_path = self._args.xml_path
 
     def SendMemoryStats(self):
@@ -55,7 +46,8 @@ class Bind(object):
         for element in memory_tree:
             value = int(element.text)
             metric = "dns.%s.memory.%s" % (self.hostname, element.tag)
-            stats.append((metric, (self.timestamp, value)))
+            logging.debug(metric.lower(), (self.timestamp, value))
+            stats.append((metric.lower(), (self.timestamp, value)))
 
         logging.debug("Memory Statistics for %s: %s", self.hostname, stats)
         self.SendToCarbon(stats)
@@ -67,17 +59,18 @@ class Bind(object):
         for rdtype in queries_in:
             metric = "dns.%s.queries-in.%s" % (self.hostname, rdtype.find("name").text)
             value = int(rdtype.find("counter").text)
-            stats.append((metric, (self.timestamp, value)))
+            logging.debug(metric.lower(), (self.timestamp, value))
+            stats.append((metric.lower(), (self.timestamp, value)))
 
         requests = self.bind_xml.iterfind(".//server/requests/opcode")
         for request in requests:
             metric = "dns.%s.requests.%s" % (self.hostname, request.find("name").text)
             value = int(request.find("counter").text)
-            stats.append((metric, (self.timestamp, value)))
+            logging.debug(metric.lower(), (self.timestamp, value))
+            stats.append((metric.lower(), (self.timestamp, value)))
 
         logging.debug("Server Statistics for %s: %s", self.hostname, stats)
         self.SendToCarbon(stats)
-
 
     def SendZoneStats(self):
         """Parse by view/zone statistics and send to Carbon."""
@@ -85,7 +78,7 @@ class Bind(object):
         zones_tree = self.bind_xml.iterfind(".//views/view/zones/zone")
         for zone in zones_tree:
             zone_name = zone.find("name").text
-            zone_split = zone_name.split("/") # "foo.com/IN/viewname"
+            zone_split = zone_name.split("/")  # "foo.com/IN/viewname"
             if zone_split[1] != "IN":
                 continue
             zone_name = zone_split[0]
@@ -96,21 +89,25 @@ class Bind(object):
 
             zone_compiled = zone_name.replace(".", "-")
             metric_base = "dns.%s.%s" % (self.hostname, zone_compiled)
+            try:
+                metric_serial = metric_base + ".serial"
+                zone_serial = int(zone.find("serial").text)
+                logging.debug((metric_serial.lower(), (self.timestamp, zone_serial)))
+                stats.append((metric_serial.lower(), (self.timestamp, zone_serial)))
+                if zone_view:
+                    metric_counter = metric_base + "." + zone_view
+                else:
+                    metric_counter = metric_base
+                for counter in zone.iterfind(".//counters/"):
+                    value = int(counter.text)
+                    metric = metric_counter + "." + counter.tag
+                    logging.debug((metric.lower(), (self.timestamp, value)))
+                    stats.append((metric.lower(), (self.timestamp, value)))
+            except:
+                pass
 
-            metric_serial = metric_base + ".serial"
-            zone_serial = int(zone.find("serial").text)
-            stats.append((metric_serial, (self.timestamp, zone_serial)))
-            if zone_view:
-                metric_counter = metric_base + "." + zone_view
-            else:
-                metric_counter = metric_base
-            for counter in zone.iterfind(".//counters/"):
-                value = int(counter.text)
-                metric = metric_counter + "." + counter.tag
-                stats.append((metric, (self.timestamp, value)))
-
-        logging.debug("Zone Statistics for %s: %s", self.hostname, stats)
-        self.SendToCarbon(stats)
+        for chunk in [stats[x:x+100] for x in xrange(0, len(stats), 100)]:
+            self.SendToCarbon(chunk)
 
     def ReadXml(self):
         """Read Bind statistics XML into self.bind_xml.
@@ -154,6 +151,8 @@ class Bind(object):
 
 
 def main():
+    LOGGING_FORMAT = "%(asctime)s : %(levelname)s : %(message)s"
+
     parser = argparse.ArgumentParser(description="Parse BIND statistics and insert them into Graphite.")
     parser.add_argument("--bind",
                         help="BIND DNS hostname and statistics port. Example: dns1:8053")
@@ -185,15 +184,13 @@ def main():
 
     logging.basicConfig(format=LOGGING_FORMAT, level=logging_level)
 
-    bind_obj = Bind(args)
-    bind_obj.ReadXml()
-
     while True:
-        logging.info("Gathering statistics to send to Carbon %s.",
-                     args.carbon)
+        logging.info("Gathering statistics to send to Carbon %s.", args.carbon)
+        bind_obj = Bind(args)
+        bind_obj.ReadXml()
+
         bind_obj.SendServerStats()
         bind_obj.SendZoneStats()
-        bind_obj.SendServerStats()
         bind_obj.SendMemoryStats()
         elapsed_time = time.time() - bind_obj.timestamp
         if bind_obj.carbon:
